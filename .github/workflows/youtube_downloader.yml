@@ -1,128 +1,171 @@
-name: YouTube Downloader Stable
+name: دانلودر یوتیوب (نسخه اصلاح شده)
 
 on:
   workflow_dispatch:
     inputs:
       video_url:
-        description: "YouTube URL"
+        description: 'لینک یوتیوب'
         required: true
         type: string
 
       output_format:
-        description: "Format"
+        description: 'نوع خروجی'
         required: true
         type: choice
         options:
           - mp4
           - mp3
-        default: mp4
+        default: 'mp4'
 
-      quality:
-        description: "Video quality (720 or 1080) / audio bitrate"
+      desired_quality:
+        description: 'کیفیت (720p, 1080p, 192kbps, 320kbps)'
         required: false
-        default: "720"
+        type: string
+        default: '720p'
 
       max_part_mb:
-        description: "Split size MB (0 = no split)"
+        description: 'حجم هر پارت (MB) - پیشنهادی 90'
         required: false
-        default: "95"
+        type: string
+        default: '90'
 
       upload_method:
-        description: "Upload method"
+        description: '📤 کجا ذخیره شود؟'
         required: true
         type: choice
         options:
           - repository
           - release
-        default: repository
+        default: 'repository'
 
 permissions:
   contents: write
 
 jobs:
-  download:
+  youtube-download:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
 
     steps:
-
-      - name: Checkout
+      - name: 📂 Checkout Repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install tools
+      - name: 🔧 Install Dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg zip
-          pip install yt-dlp
+          sudo apt-get update -qq
+          sudo apt-get install -y zip curl python3 python3-pip
+          pip3 install --quiet requests
 
-      - name: Download YouTube
-        id: yt
+      - name: 🔗 Get Download Link
+        id: retrieve
         run: |
-          URL="${{ github.event.inputs.video_url }}"
-          FORMAT="${{ github.event.inputs.output_format }}"
-          QUALITY="${{ github.event.inputs.quality }}"
+          python3 << 'EOF'
+          import os, sys, time, re, requests
 
+          URL  = os.environ.get('INPUT_URL')
+          FMT  = os.environ.get('INPUT_FORMAT')
+          QUAL = os.environ.get('INPUT_QUALITY')
+
+          payload = {
+              "url": URL,
+              "os": "linux",
+              "output": {"type": "audio" if FMT == 'mp3' else "video", "format": FMT}
+          }
+          if FMT == 'mp3':
+              payload["audio"] = {"bitrate": QUAL if 'kbps' in QUAL else '192kbps'}
+          else:
+              payload["output"]["quality"] = QUAL if 'p' in QUAL else '720p'
+
+          s = requests.Session()
+          s.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
+          
+          try:
+              # گرفتن توکن اولیه
+              s.get("https://media.ytmp3.gg/", timeout=20)
+              resp = s.post("https://hub.ytconvert.org/api/download", json=payload, timeout=30)
+              resp.raise_for_status()
+              data = resp.json()
+              
+              status_url = data.get('statusUrl')
+              title = data.get('title', 'video')
+              
+              dl_url = None
+              for _ in range(100): # صبر برای آماده‌سازی فایل
+                  time.sleep(3)
+                  r = s.get(status_url, timeout=20)
+                  status = r.json()
+                  if status.get('status') == 'completed':
+                      dl_url = status.get('downloadUrl')
+                      break
+                  if status.get('status') == 'failed':
+                      print("::error::Server failed to convert video")
+                      sys.exit(1)
+
+              if not dl_url:
+                  print("::error::Timeout waiting for download link")
+                  sys.exit(1)
+
+              # پاکسازی نام فایل برای جلوگیری از ارور لینوکس
+              clean_title = re.sub(r'[^\w\s-]', '', title).strip().replace(' ', '_')
+              clean_title = clean_title[:50] # محدود کردن طول نام
+              fname = f"{clean_title}.{FMT}"
+
+              with open(".download_info", "w", encoding="utf-8") as f:
+                  f.write(f"{dl_url}\n{fname}\n{title}")
+
+              with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+                  f.write(f"filename={fname}\n")
+          except Exception as e:
+              print(f"::error::Python Script Error: {str(e)}")
+              sys.exit(1)
+          EOF
+        env:
+          INPUT_URL:     ${{ github.event.inputs.video_url }}
+          INPUT_FORMAT:  ${{ github.event.inputs.output_format }}
+          INPUT_QUALITY: ${{ github.event.inputs.desired_quality }}
+
+      - name: 📥 Download File
+        run: |
+          DL_URL=$(head -1 .download_info)
+          FILENAME=$(sed -n '2p' .download_info)
           mkdir -p release_files
+          echo "Downloading: $FILENAME"
+          curl -L --retry 3 --fail -o "release_files/$FILENAME" "$DL_URL"
 
-          if [ "$FORMAT" = "mp3" ]; then
-            yt-dlp -x --audio-format mp3 \
-              --audio-quality 0 \
-              -o "release_files/%(title)s.%(ext)s" \
-              "$URL"
-          else
-            if [ "$QUALITY" = "1080" ]; then
-              FMT="bestvideo[height<=1080]+bestaudio/best"
-            else
-              FMT="bestvideo[height<=720]+bestaudio/best"
-            fi
-
-            yt-dlp -f "$FMT" \
-              -o "release_files/%(title)s.%(ext)s" \
-              "$URL"
-          fi
-
-          FILE=$(ls release_files | head -n1)
-          echo "filename=$FILE" >> $GITHUB_OUTPUT
-
-      - name: Split large file
+      - name: ✂️ Split Large File
+        id: splitter
         run: |
-          FILE="${{ steps.yt.outputs.filename }}"
-          FILEPATH="release_files/$FILE"
-          MAX_MB="${{ github.event.inputs.max_part_mb }}"
-
-          if [[ "$MAX_MB" -le 0 ]]; then
-            echo "Skipping split"
-            exit 0
-          fi
-
-          SIZE=$(stat -c%s "$FILEPATH")
-          LIMIT=$((MAX_MB * 1024 * 1024))
-
-          if [ "$SIZE" -le "$LIMIT" ]; then
-            echo "No split needed"
-            exit 0
-          fi
-
+          FILENAME=$(sed -n '2p' .download_info)
+          THRESH_MB="${{ github.event.inputs.max_part_mb }}"
           cd release_files
-          BASENAME="${FILE%.*}"
-          zip -r -s "${MAX_MB}m" "${BASENAME}.zip" "$FILE"
-          rm "$FILE"
+          FILESIZE=$(stat -c%s "$FILENAME")
+          THRESH_BYTES=$((THRESH_MB * 1024 * 1024))
+
+          if [ "$FILESIZE" -gt "$THRESH_BYTES" ]; then
+            echo "Splitting $FILENAME..."
+            zip -s "${THRESH_MB}m" "${FILENAME%.*}.zip" "$FILENAME"
+            rm "$FILENAME"
+            echo "split=true" >> $GITHUB_OUTPUT
+          else
+            echo "split=false" >> $GITHUB_OUTPUT
+          fi
           cd ..
 
-      - name: Upload to repository
+      - name: 📤 Upload to Repository
         if: github.event.inputs.upload_method == 'repository'
         run: |
-          git config user.name "github-actions"
-          git config user.email "actions@github.com"
-
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           mkdir -p downloads
           mv release_files/* downloads/
-
+          git pull origin ${{ github.ref_name }} --rebase
           git add downloads/
-          git commit -m "YouTube download"
+          git commit -m "Add YouTube Download: ${{ steps.retrieve.outputs.filename }}" || echo "Nothing to commit"
           git push
 
-      - name: Upload release
+      - name: 📤 Upload to Release
         if: github.event.inputs.upload_method == 'release'
         uses: softprops/action-gh-release@v2
         with:
